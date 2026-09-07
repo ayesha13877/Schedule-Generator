@@ -338,71 +338,73 @@ combination. If a slot truly cannot be filled, set "subject" and "teacher" to
 # --------------------------------------------------------------------------
 # Groq LLM call
 # --------------------------------------------------------------------------
-SCHEDULE_JSON_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "schedule": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "day": {"type": "string"},
-                    "period": {"type": "integer"},
-                    "section": {"type": "string"},
-                    "subject": {"type": "string"},
-                    "teacher": {"type": "string"},
-                },
-                "required": ["day", "period", "section", "subject", "teacher"],
-                "additionalProperties": False,
-            },
-        },
-        "warnings": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["schedule", "warnings"],
-    "additionalProperties": False,
-}
 
 
-def call_llm(prompt: str, key: str) -> dict:
-    # Size the output budget to the schedule: each row needs ~25-30 tokens
-    # of JSON, plus generous headroom. Groq's default max_tokens is only
-    # 1024, which truncates anything beyond a tiny timetable — that caused
-    # the earlier "does not match schema" / cut-off JSON error.
-    sections = parse_list(sections_raw)
-    breaks = parse_list(break_periods_raw)
-    non_break_periods = max(periods_per_day - len(breaks), 1)
-    est_rows = max(len(working_days) * non_break_periods * max(len(sections), 1), 1)
-    token_budget = min(max(est_rows * 40 + 1500, 4000), 32000)
-
+def _request_schedule(prompt: str, key: str, token_budget: int, reasoning_effort: str) -> tuple[dict, str]:
+    """Single call to Groq. Returns (parsed_json, finish_reason)."""
     client = Groq(api_key=key)
     completion = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert school timetable scheduler. "
-                            "Always respond with valid JSON only, no markdown fences.",
+                "content": (
+                    "You are an expert school timetable scheduler. Always respond "
+                    "with a single valid JSON object only — no markdown fences, no "
+                    "commentary before or after. The \"schedule\" array must never "
+                    "be empty: it must contain one entry for every (day, period, "
+                    "section) combination described in the prompt."
+                ),
             },
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,
         max_completion_tokens=token_budget,
-        reasoning_effort="low",  # keep more of the token budget for the actual JSON output
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "schedule_response",
-                "strict": True,
-                "schema": SCHEDULE_JSON_SCHEMA,
-            },
-        },
+        reasoning_effort=reasoning_effort,
+        response_format={"type": "json_object"},
     )
-    text = completion.choices[0].message.content or ""
+    choice = completion.choices[0]
+    text = choice.message.content or ""
     st.session_state.raw_model_text = text
     cleaned = text.strip()
     cleaned = re.sub(r"^```(json)?", "", cleaned.strip())
     cleaned = re.sub(r"```$", "", cleaned.strip())
-    return json.loads(cleaned)
+    return json.loads(cleaned), (choice.finish_reason or "")
+
+
+def call_llm(prompt: str, key: str) -> dict:
+    # Size the output budget to the schedule: each row needs ~25-30 tokens
+    # of JSON, plus generous headroom. Groq's default max_tokens is only
+    # 1024, which truncates anything beyond a tiny timetable.
+    sections = parse_list(sections_raw)
+    breaks = parse_list(break_periods_raw)
+    non_break_periods = max(periods_per_day - len(breaks), 1)
+    est_rows = max(len(working_days) * non_break_periods * max(len(sections), 1), 1)
+    token_budget = min(max(est_rows * 50 + 2000, 6000), 32000)
+
+    result, finish_reason = _request_schedule(prompt, key, token_budget, "medium")
+
+    # Some smaller/rushed generations come back with an empty schedule even
+    # though the call itself succeeded. Retry once with a stronger nudge
+    # and higher reasoning effort before giving up.
+    if not result.get("schedule"):
+        retry_prompt = prompt + (
+            "\n\nIMPORTANT: your previous attempt returned an EMPTY schedule "
+            "array. This is not acceptable — you must generate the full "
+            "timetable with one row per (day, period, section). Do not "
+            "leave the schedule array empty."
+        )
+        result, finish_reason = _request_schedule(
+            retry_prompt, key, min(token_budget + 4000, 32000), "high"
+        )
+
+    if finish_reason == "length":
+        raise ValueError(
+            "truncated: the model's response was cut off before it finished "
+            "the schedule. Try reducing the number of sections/days, or "
+            "generate again."
+        )
+    return result
 
 
 def validate_inputs():
@@ -506,15 +508,17 @@ with tab_generate:
                 )
                 with st.expander("Show raw model output"):
                     st.code(st.session_state.raw_model_text or "")
-            except (APIError, APIConnectionError) as e:
-                if "json_validate_failed" in str(e) or "does not match" in str(e):
+            except ValueError as e:
+                if str(e).startswith("truncated"):
                     st.error(
                         "The AI's response was too long and got cut off before "
                         "finishing the schedule. Try reducing the number of "
                         "sections/days in one go, or click Generate again."
                     )
                 else:
-                    st.error(f"Groq API error: {e}")
+                    st.error(f"Unexpected error: {e}")
+            except (APIError, APIConnectionError) as e:
+                st.error(f"Groq API error: {e}")
             except Exception as e:  # noqa: BLE001
                 st.error(f"Unexpected error: {e}")
 
