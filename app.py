@@ -1,20 +1,19 @@
 """
 Teacher Schedule Generator
-A Streamlit app that uses Google's Gemini Flash model to auto-generate
+A Streamlit app that uses Groq's free-tier Llama model to auto-generate
 a weekly teacher timetable from user-supplied inputs (timings, teachers,
 qualifications, load, and constraints).
 """
 
 import io
 import json
+import os
 import re
 from dataclasses import dataclass, field, asdict
 
 import pandas as pd
 import streamlit as st
-from google import genai
-from google.genai import types
-from google.genai.errors import ClientError, ServerError
+from groq import Groq, APIError, APIConnectionError
 
 
 # --------------------------------------------------------------------------
@@ -60,7 +59,21 @@ CUSTOM_CSS = """
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-DEFAULT_MODEL = "gemini-flash-latest"  # Google-maintained alias -> current Gemini Flash model
+# "llama-3.3-70b-versatile" runs on Groq's free tier (no credit card needed)
+# and is fast + reliable for structured JSON generation.
+MODEL_NAME = "llama-3.3-70b-versatile"
+
+
+def get_api_key() -> str | None:
+    """Read the Groq API key from Streamlit secrets (preferred) or an
+    environment variable, so the app ships pre-configured and end users
+    never have to paste a key in."""
+    try:
+        if "GROQ_API_KEY" in st.secrets:
+            return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("GROQ_API_KEY")
 
 
 # --------------------------------------------------------------------------
@@ -94,26 +107,9 @@ if "raw_model_text" not in st.session_state:
 # --------------------------------------------------------------------------
 # Sidebar — API configuration
 # --------------------------------------------------------------------------
+api_key = get_api_key()
+
 with st.sidebar:
-    st.markdown("### ⚙️ Gemini API settings")
-    api_key = st.text_input(
-        "Gemini API key",
-        type="password",
-        help="Get a free key from Google AI Studio (aistudio.google.com/apikey). "
-             "It is only kept in this browser session and never saved to disk.",
-    )
-    model_name = st.text_input(
-        "Model name",
-        value=DEFAULT_MODEL,
-        help="Default uses Google's 'latest Flash' alias so it keeps working as "
-             "models are updated. You can pin an exact model name instead, "
-             "e.g. gemini-2.5-flash.",
-    )
-    st.caption(
-        "Your key is stored only in this session's memory (`st.session_state`), "
-        "sent directly to Google's API, and is cleared when you close the tab."
-    )
-    st.divider()
     st.markdown("### ℹ️ About")
     st.caption(
         "Fill in class timings, add teachers, set constraints, then click "
@@ -128,7 +124,7 @@ with st.sidebar:
 st.title("🗓️ Teacher Schedule Generator")
 st.markdown(
     '<p class="app-subtitle">Describe your school day, add your teaching staff, '
-    'set any constraints — Gemini drafts a full weekly timetable.</p>',
+    'set any constraints — the AI drafts a full weekly timetable.</p>',
     unsafe_allow_html=True,
 )
 
@@ -335,19 +331,24 @@ combination. If a slot truly cannot be filled, set "subject" and "teacher" to
 
 
 # --------------------------------------------------------------------------
-# Gemini call
+# Groq LLM call
 # --------------------------------------------------------------------------
-def call_gemini(prompt: str, key: str, model: str) -> dict:
-    client = genai.Client(api_key=key)
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.3,
-            response_mime_type="application/json",
-        ),
+def call_llm(prompt: str, key: str) -> dict:
+    client = Groq(api_key=key)
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an expert school timetable scheduler. "
+                            "Always respond with valid JSON only, no markdown fences.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+        response_format={"type": "json_object"},
     )
-    text = response.text or ""
+    text = completion.choices[0].message.content or ""
     st.session_state.raw_model_text = text
     cleaned = text.strip()
     cleaned = re.sub(r"^```(json)?", "", cleaned.strip())
@@ -358,7 +359,10 @@ def call_gemini(prompt: str, key: str, model: str) -> dict:
 def validate_inputs():
     problems = []
     if not api_key:
-        problems.append("Enter your Gemini API key in the sidebar.")
+        problems.append(
+            "No Groq API key configured. The app owner needs to add "
+            "GROQ_API_KEY in Streamlit secrets — see the deployment guide."
+        )
     if not working_days:
         problems.append("Select at least one working day.")
     if not parse_list(sections_raw):
@@ -441,9 +445,9 @@ with tab_generate:
 
     if generate_clicked:
         prompt = build_prompt()
-        with st.spinner("Gemini is building your timetable..."):
+        with st.spinner("The AI is building your timetable..."):
             try:
-                result = call_gemini(prompt, api_key, model_name)
+                result = call_llm(prompt, api_key)
                 st.session_state.schedule_result = result
                 st.success("Schedule generated successfully.")
             except json.JSONDecodeError:
@@ -453,8 +457,8 @@ with tab_generate:
                 )
                 with st.expander("Show raw model output"):
                     st.code(st.session_state.raw_model_text or "")
-            except (ClientError, ServerError) as e:
-                st.error(f"Gemini API error: {e}")
+            except (APIError, APIConnectionError) as e:
+                st.error(f"Groq API error: {e}")
             except Exception as e:  # noqa: BLE001
                 st.error(f"Unexpected error: {e}")
 
