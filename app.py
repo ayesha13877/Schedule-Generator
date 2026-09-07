@@ -61,7 +61,12 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # "llama-3.3-70b-versatile" runs on Groq's free tier (no credit card needed)
 # and is fast + reliable for structured JSON generation.
-MODEL_NAME = "llama-3.3-70b-versatile"
+# "llama-3.3-70b-versatile" was moved to Groq's Enterprise-only tier and is
+# no longer reachable with a normal free API key (this caused the 404
+# "model_not_found" error). "openai/gpt-oss-120b" is available on Groq's
+# free tier, is fast, and — unlike most Groq models — supports STRICT JSON
+# Schema mode, which guarantees the response matches our schema exactly.
+MODEL_NAME = "openai/gpt-oss-120b"
 
 
 def get_api_key() -> str | None:
@@ -333,6 +338,31 @@ combination. If a slot truly cannot be filled, set "subject" and "teacher" to
 # --------------------------------------------------------------------------
 # Groq LLM call
 # --------------------------------------------------------------------------
+SCHEDULE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "schedule": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "string"},
+                    "period": {"type": "integer"},
+                    "section": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "teacher": {"type": "string"},
+                },
+                "required": ["day", "period", "section", "subject", "teacher"],
+                "additionalProperties": False,
+            },
+        },
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["schedule", "warnings"],
+    "additionalProperties": False,
+}
+
+
 def call_llm(prompt: str, key: str) -> dict:
     client = Groq(api_key=key)
     completion = client.chat.completions.create(
@@ -346,7 +376,14 @@ def call_llm(prompt: str, key: str) -> dict:
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,
-        response_format={"type": "json_object"},
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "schedule_response",
+                "strict": True,
+                "schema": SCHEDULE_JSON_SCHEMA,
+            },
+        },
     )
     text = completion.choices[0].message.content or ""
     st.session_state.raw_model_text = text
