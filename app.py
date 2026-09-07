@@ -364,6 +364,16 @@ SCHEDULE_JSON_SCHEMA = {
 
 
 def call_llm(prompt: str, key: str) -> dict:
+    # Size the output budget to the schedule: each row needs ~25-30 tokens
+    # of JSON, plus generous headroom. Groq's default max_tokens is only
+    # 1024, which truncates anything beyond a tiny timetable — that caused
+    # the earlier "does not match schema" / cut-off JSON error.
+    sections = parse_list(sections_raw)
+    breaks = parse_list(break_periods_raw)
+    non_break_periods = max(periods_per_day - len(breaks), 1)
+    est_rows = max(len(working_days) * non_break_periods * max(len(sections), 1), 1)
+    token_budget = min(max(est_rows * 40 + 1500, 4000), 32000)
+
     client = Groq(api_key=key)
     completion = client.chat.completions.create(
         model=MODEL_NAME,
@@ -376,6 +386,8 @@ def call_llm(prompt: str, key: str) -> dict:
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,
+        max_completion_tokens=token_budget,
+        reasoning_effort="low",  # keep more of the token budget for the actual JSON output
         response_format={
             "type": "json_schema",
             "json_schema": {
@@ -495,7 +507,14 @@ with tab_generate:
                 with st.expander("Show raw model output"):
                     st.code(st.session_state.raw_model_text or "")
             except (APIError, APIConnectionError) as e:
-                st.error(f"Groq API error: {e}")
+                if "json_validate_failed" in str(e) or "does not match" in str(e):
+                    st.error(
+                        "The AI's response was too long and got cut off before "
+                        "finishing the schedule. Try reducing the number of "
+                        "sections/days in one go, or click Generate again."
+                    )
+                else:
+                    st.error(f"Groq API error: {e}")
             except Exception as e:  # noqa: BLE001
                 st.error(f"Unexpected error: {e}")
 
